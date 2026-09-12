@@ -259,6 +259,8 @@ function axisGrid(gray,w,h,vertical){
   const n=vertical?w:h, other=vertical?h:w;
   const score=new Float64Array(n);
   const a0=Math.floor(other*0.02), a1=Math.ceil(other*0.98);
+
+  // Edge energy along this axis.
   for(let i=1;i<n-1;i++){
     let sum=0,c=0;
     for(let j=a0;j<a1;j+=2){
@@ -268,58 +270,126 @@ function axisGrid(gray,w,h,vertical){
     }
     score[i]=c?sum/c:0;
   }
+
   const med=percentile(score,.50);
   const centered=Array.from(score,v=>Math.max(0,v-med));
-  let bestLag=0,best=-Infinity;
-  const minLag=5, maxLag=Math.min(90,Math.floor(n/6));
+
+  // Normalized autocorrelation. Grid lines generate peaks at the true cell
+  // spacing AND its multiples. We intentionally prefer the SMALLEST strong
+  // local maximum so 36x28 does not collapse to 18x14 / 14x11.
+  const minLag=4;
+  const maxLag=Math.min(80,Math.floor(n/5));
+  const corr=new Float64Array(maxLag+1);
+  let maxCorr=0;
   for(let lag=minLag;lag<=maxLag;lag++){
-    let sum=0,c=0;
-    for(let i=1;i<n-lag;i++){sum+=centered[i]*centered[i+lag];c++;}
-    const v=c?sum/c:0;
-    if(v>best){best=v;bestLag=lag;}
+    let ab=0,aa=0,bb=0,c=0;
+    for(let i=1;i<n-lag;i++){
+      const a=centered[i], b=centered[i+lag];
+      ab+=a*b; aa+=a*a; bb+=b*b; c++;
+    }
+    corr[lag]=(aa>0&&bb>0)?ab/Math.sqrt(aa*bb):0;
+    if(corr[lag]>maxCorr) maxCorr=corr[lag];
   }
-  if(!bestLag) return null;
+  if(maxCorr<=0) return null;
+
+  const candidates=[];
+  for(let lag=minLag+1;lag<maxLag;lag++){
+    if(corr[lag]>=corr[lag-1] && corr[lag]>=corr[lag+1]){
+      const approxCells=n/lag;
+      if(approxCells>=8 && approxCells<=120){
+        candidates.push({lag,c:corr[lag]});
+      }
+    }
+  }
+  if(!candidates.length) return null;
+
+  // Prefer the fundamental spacing: smallest local peak that is still
+  // reasonably close to the strongest periodic peak.
+  const strongThreshold=Math.max(0.22,maxCorr*0.58);
+  let chosen=candidates.find(x=>x.c>=strongThreshold);
+  if(!chosen){
+    candidates.sort((a,b)=>b.c-a.c);
+    chosen=candidates[0];
+  }
+  let bestLag=chosen.lag;
+
+  // If the chosen lag is still a harmonic, test exact divisors.
+  for(const div of [3,2]){
+    const d=Math.round(bestLag/div);
+    if(d>=minLag && corr[d]>=Math.max(0.18,corr[bestLag]*0.50)){
+      bestLag=d;
+    }
+  }
+
+  // Best phase for the selected fundamental spacing.
   let bestPhase=0,bestPhaseScore=-Infinity;
   for(let ph=0;ph<bestLag;ph++){
     let sum=0,c=0;
     for(let x=ph;x<n;x+=bestLag){
       let local=0;
-      for(let d=-2;d<=2;d++) if(x+d>=0&&x+d<n) local=Math.max(local,score[x+d]);
+      for(let d=-2;d<=2;d++){
+        const xx=x+d;
+        if(xx>=0&&xx<n) local=Math.max(local,score[xx]);
+      }
       sum+=local;c++;
     }
-    if(c && sum/c>bestPhaseScore){bestPhaseScore=sum/c;bestPhase=ph;}
+    const v=c?sum/c:0;
+    if(v>bestPhaseScore){bestPhaseScore=v;bestPhase=ph;}
   }
+
+  // Generate and locally snap every grid line.
   const lines=[];
-  for(let k=Math.floor((0-bestPhase)/bestLag)-1;k<=Math.ceil((n-bestPhase)/bestLag)+1;k++){
+  for(let k=Math.floor((0-bestPhase)/bestLag)-2;
+      k<=Math.ceil((n-bestPhase)/bestLag)+2;k++){
     const expected=bestPhase+k*bestLag;
-    if(expected<-3 || expected>n+3) continue;
-    let pos=Math.round(expected), strength=-1;
+    if(expected<-4 || expected>n+4) continue;
+    let pos=Math.round(expected),strength=-1;
     for(let d=-3;d<=3;d++){
       const x=Math.round(expected+d);
-      if(x>=0&&x<n && score[x]>strength){strength=score[x];pos=x;}
+      if(x>=0&&x<n&&score[x]>strength){strength=score[x];pos=x;}
     }
-    if(pos>=0&&pos<n && (!lines.length || pos-lines[lines.length-1].pos>bestLag*0.45))
+    if(pos>=0&&pos<n &&
+       (!lines.length || pos-lines[lines.length-1].pos>bestLag*0.55)){
       lines.push({pos,strength});
+    }
   }
   if(lines.length<9) return null;
-  return {spacing:bestLag,score:Array.from(score),lines};
+  return {spacing:bestLag,score:Array.from(score),lines,corr:Array.from(corr)};
 }
 
 function chooseGridWindow(axis,n){
   const L=axis.lines, sp=axis.spacing;
   let best=null;
+
+  // Candidate line runs. Strong preference for more cells, while still
+  // requiring regular spacing and reasonable outer margins.
   for(let i=0;i<L.length-8;i++){
     for(let j=i+8;j<L.length;j++){
       const cells=j-i;
-      if(cells>100) break;
+      if(cells>120) break;
       const first=L[i].pos,last=L[j].pos;
       const span=last-first;
-      if(Math.abs(span-cells*sp)>sp*1.2) continue;
+      const expected=cells*sp;
+      if(Math.abs(span-expected)>sp*1.35) continue;
+
       let strength=0;
       for(let k=i;k<=j;k++) strength+=L[k].strength;
       strength/=(cells+1);
-      const marginPenalty=Math.abs(first-(n-1-last))/Math.max(1,n);
-      const score=strength + cells*0.035 - marginPenalty*4;
+
+      const left=Math.max(0,first);
+      const right=Math.max(0,n-1-last);
+      const outside=(left+right)/Math.max(1,n);
+      const asym=Math.abs(left-right)/Math.max(1,n);
+
+      // Completeness is more important than picking only the strongest center.
+      const coverage=span/Math.max(1,n-1);
+      const score=
+        strength*0.55 +
+        cells*0.38 +
+        coverage*8 -
+        outside*3 -
+        asym*1.5;
+
       if(!best || score>best.score) best={i,j,cells,score};
     }
   }
@@ -342,6 +412,13 @@ function detectGridFromImage(){
   const wx=chooseGridWindow(ax,w), wy=chooseGridWindow(ay,h);
   if(!wx||!wy) return null;
   if(wx.cells<8||wy.cells<8||wx.cells>200||wy.cells>200) return null;
+
+  // Dense pixel-art grids should not suddenly shrink to a tiny count.
+  // If both dimensions are below 18 while many repeated edges exist,
+  // this is almost certainly a harmonic detection error.
+  if(wx.cells<18 && wy.cells<18){
+    return null;
+  }
   const inv=1/scale;
   const xLines=ax.lines.slice(wx.i,wx.j+1).map(v=>v.pos*inv);
   const yLines=ay.lines.slice(wy.i,wy.j+1).map(v=>v.pos*inv);
@@ -353,7 +430,7 @@ function detectGridFromImage(){
 }
 function fallbackGrid(){
   const iw=img.naturalWidth||img.width, ih=img.naturalHeight||img.height;
-  const long=40;
+  const long=36;
   return iw>=ih
     ? {cols:long,rows:Math.max(8,Math.round(long*ih/iw))}
     : {rows:long,cols:Math.max(8,Math.round(long*iw/ih))};
@@ -365,7 +442,7 @@ function autoResize(){
     autoGrid=detectGridFromImage();
     if(autoGrid){
       gw.value=autoGrid.cols; gh.value=autoGrid.rows;
-      autoStatus.textContent=`จับ Grid ได้ ${autoGrid.cols} × ${autoGrid.rows} ช่อง • ใช้เส้นเดิมของรูป`;
+      autoStatus.textContent=`จับ Grid เดิมได้ ${autoGrid.cols} × ${autoGrid.rows} ช่อง • รักษาขอบบน/ล่าง/ซ้าย/ขวาครบ`;
     } else {
       const f=fallbackGrid();
       gw.value=f.cols;gh.value=f.rows;
