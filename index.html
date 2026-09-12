@@ -104,7 +104,7 @@
   .gridScroller{overflow:auto;padding:8px;max-height:62vh;background:#fff}
   .gridScroller canvas{display:block;max-width:none}
   .compactLegend{padding:10px;grid-template-columns:repeat(auto-fit,minmax(74px,1fr));margin-top:0}
-  .hiddenStats{display:none}
+  .autoStatus{margin-top:8px;font-size:12px;font-weight:800;color:#777;text-align:center}.hiddenStats{display:none}
   .emptyHint{font-size:13px;color:#999;font-weight:800;text-align:center}
   @media(max-width:520px){
     .compactApp{padding:10px 10px 24px}
@@ -196,6 +196,7 @@
     </div>
 
     <button id="autoBtn" class="ghost fullBtn" disabled>AUTO RESIZE</button>
+    <div id="autoStatus" class="autoStatus">ระบบจะพยายามตรวจจับเส้น Grid และจำนวนช่องจากรูปต้นฉบับ</div>
   </section>
 
   <section class="compareCompact">
@@ -217,7 +218,7 @@
   </section>
 
   <div class="actionRow">
-    <button id="genBtn" class="primary actionBtn" disabled>GENERATE</button>
+    <button id="genBtn" class="primary actionBtn" title="Clean grid + closest bead palette" disabled>GENERATE</button>
     <button id="downloadBtn" class="dark actionBtn" disabled>SAVE PIXEL</button>
   </div>
 
@@ -260,9 +261,11 @@ const beforeImage = document.getElementById('beforeImage');
 const beforeEmpty = document.getElementById('beforeEmpty');
 const afterEmpty = document.getElementById('afterEmpty');
 const legendGrid = document.getElementById('legendGrid');
+const autoStatus = document.getElementById('autoStatus');
 
 let img = null;
 let lastResult = null;
+let autoGrid = null;
 
 maxSize.addEventListener('input',()=>maxOut.textContent=maxSize.value);
 
@@ -299,6 +302,7 @@ fileInput.addEventListener('change', e=>{
     const im=new Image();
     im.onload=()=>{
       img=im;
+      autoGrid=null;
       beforeImage.src=reader.result;
       beforeImage.style.display='block';
       beforeEmpty.style.display='none';
@@ -313,43 +317,224 @@ fileInput.addEventListener('change', e=>{
   reader.readAsDataURL(f);
 });
 
+function percentile(arr,p){
+  const a=[...arr].sort((x,y)=>x-y);
+  if(!a.length) return 0;
+  const i=Math.max(0,Math.min(a.length-1,Math.round((a.length-1)*p)));
+  return a[i];
+}
+
+function dominantGridAxis(gray,w,h,vertical){
+  const n=vertical?w:h;
+  const other=vertical?h:w;
+  const score=new Float64Array(n);
+  const start=Math.floor(other*0.04), end=Math.ceil(other*0.96);
+  for(let i=1;i<n;i++){
+    let sum=0,c=0;
+    for(let j=start;j<end;j+=2){
+      const a=vertical?gray[j*w+i]:gray[i*w+j];
+      const b=vertical?gray[j*w+i-1]:gray[(i-1)*w+j];
+      sum+=Math.abs(a-b); c++;
+    }
+    score[i]=c?sum/c:0;
+  }
+  const base=percentile(score,0.5);
+  const hi=percentile(score,0.92);
+  const v=Array.from(score,x=>Math.max(0,x-base));
+  let bestLag=0,bestCorr=-1;
+  const minLag=4, maxLag=Math.min(80,Math.floor(n/5));
+  for(let lag=minLag;lag<=maxLag;lag++){
+    let s=0,c=0;
+    for(let i=1;i<n-lag;i++){ s+=v[i]*v[i+lag]; c++; }
+    const corr=c?s/c:0;
+    if(corr>bestCorr){bestCorr=corr;bestLag=lag;}
+  }
+  if(!bestLag) return null;
+
+  let bestPhase=0,bestPhaseScore=-1;
+  for(let ph=0;ph<bestLag;ph++){
+    let s=0,c=0;
+    for(let x=ph;x<n;x+=bestLag){
+      let local=0;
+      for(let d=-1;d<=1;d++) if(x+d>=0&&x+d<n) local=Math.max(local,score[x+d]);
+      s+=local;c++;
+    }
+    const q=c?s/c:0;
+    if(q>bestPhaseScore){bestPhaseScore=q;bestPhase=ph;}
+  }
+
+  const peaks=[];
+  for(let k=-2;k<Math.ceil(n/bestLag)+2;k++){
+    const center=bestPhase+k*bestLag;
+    if(center<0||center>=n) continue;
+    let bp=center,bs=-1;
+    for(let d=-2;d<=2;d++){
+      const x=center+d;
+      if(x>=0&&x<n&&score[x]>bs){bs=score[x];bp=x;}
+    }
+    peaks.push({pos:bp,strength:bs});
+  }
+  const threshold=base+(hi-base)*0.18;
+  let best={a:0,b:-1,len:0}, a=0, misses=0;
+  for(let i=0;i<peaks.length;i++){
+    if(peaks[i].strength<threshold) misses++; else misses=Math.max(0,misses-1);
+    while(misses>2 && a<i){ if(peaks[a].strength<threshold) misses--; a++; }
+    const len=i-a+1;
+    if(len>best.len){best={a,b:i,len};}
+  }
+  let use=peaks.slice(best.a,best.b+1);
+  if(use.length<6) use=peaks;
+  const first=use[0]?.pos??0, last=use[use.length-1]?.pos??n-1;
+  const count=Math.round((last-first)/bestLag);
+  const periodicity=(hi>0)?bestPhaseScore/hi:0;
+  return {spacing:bestLag,first,last,count,confidence:periodicity,score:Array.from(score)};
+}
+
+function detectGridFromImage(){
+  const maxDim=760;
+  const iw=img.naturalWidth||img.width, ih=img.naturalHeight||img.height;
+  const scale=Math.min(1,maxDim/Math.max(iw,ih));
+  const w=Math.max(32,Math.round(iw*scale)), h=Math.max(32,Math.round(ih*scale));
+  const c=document.createElement('canvas'); c.width=w;c.height=h;
+  const ctx=c.getContext('2d',{willReadFrequently:true});
+  ctx.imageSmoothingEnabled=true;ctx.drawImage(img,0,0,w,h);
+  const d=ctx.getImageData(0,0,w,h).data;
+  const gray=new Float32Array(w*h);
+  for(let i=0,j=0;i<d.length;i+=4,j++) gray[j]=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
+  const ax=dominantGridAxis(gray,w,h,true), ay=dominantGridAxis(gray,w,h,false);
+  if(!ax||!ay) return null;
+  let cols=ax.count, rows=ay.count;
+  if(cols<8||rows<8||cols>200||rows>200) return null;
+  if(ax.confidence<0.42||ay.confidence<0.42) return null;
+  const inv=1/scale;
+  return {
+    cols,rows,
+    x0:ax.first*inv,y0:ay.first*inv,
+    x1:ax.last*inv,y1:ay.last*inv,
+    cellW:ax.spacing*inv,cellH:ay.spacing*inv,
+    confidence:Math.min(ax.confidence,ay.confidence)
+  };
+}
+
 function autoResize(){
   if(!img) return;
-  const m=+maxSize.value;
-  if(img.width>=img.height){
-    gw.value=m;
-    gh.value=Math.max(8,Math.round(m*img.height/img.width));
-  } else {
-    gh.value=m;
-    gw.value=Math.max(8,Math.round(m*img.width/img.height));
-  }
+  autoStatus.textContent='กำลังตรวจจับเส้น Grid และขนาดช่อง…';
+  requestAnimationFrame(()=>{
+    autoGrid=detectGridFromImage();
+    if(autoGrid){
+      gw.value=autoGrid.cols;
+      gh.value=autoGrid.rows;
+      autoStatus.textContent=`ตรวจจับ Grid ได้ประมาณ ${autoGrid.cols} × ${autoGrid.rows} ช่อง และจะจัดตำแหน่งตามเส้นเดิมของรูป`;
+    }else{
+      const m=+maxSize.value;
+      if(img.width>=img.height){
+        gw.value=m; gh.value=Math.max(8,Math.round(m*img.height/img.width));
+      }else{
+        gh.value=m; gw.value=Math.max(8,Math.round(m*img.width/img.height));
+      }
+      autoStatus.textContent=`ไม่พบเส้น Grid ชัดเจน — ใช้สัดส่วนภาพอัตโนมัติ ${gw.value} × ${gh.value}`;
+    }
+  });
 }
 autoBtn.addEventListener('click',autoResize);
 
+function colorDistanceLab(a,b){
+  const dl=a[0]-b[0], da=a[1]-b[1], db=a[2]-b[2];
+  return Math.sqrt(dl*dl+da*da+db*db);
+}
+
+function median(values){
+  if(!values.length) return 255;
+  values.sort((a,b)=>a-b);
+  const m=Math.floor(values.length/2);
+  return values.length%2 ? values[m] : Math.round((values[m-1]+values[m])/2);
+}
+
+function estimateBackgroundColor(srcCanvas){
+  const ctx=srcCanvas.getContext('2d',{willReadFrequently:true});
+  const w=srcCanvas.width,h=srcCanvas.height;
+  const data=ctx.getImageData(0,0,w,h).data;
+  const rs=[],gs=[],bs=[];
+  const edge=Math.max(2,Math.round(Math.min(w,h)*0.025));
+  const step=Math.max(1,Math.floor(Math.min(w,h)/180));
+  function add(x,y){
+    const i=(y*w+x)*4;
+    if(data[i+3]<20) return;
+    rs.push(data[i]); gs.push(data[i+1]); bs.push(data[i+2]);
+  }
+  for(let x=0;x<w;x+=step){
+    for(let y=0;y<edge;y+=step){ add(x,y); add(x,h-1-y); }
+  }
+  for(let y=0;y<h;y+=step){
+    for(let x=0;x<edge;x+=step){ add(x,y); add(w-1-x,y); }
+  }
+  return {r:median(rs),g:median(gs),b:median(bs)};
+}
+
+function sampleCellMedian(data,sw,sh,x0,y0,x1,y1){
+  // Ignore the outer 18% of each region so grid lines / antialias edges
+  // do not contaminate the bead color.
+  const mx=(x1-x0)*0.18, my=(y1-y0)*0.18;
+  let xa=Math.max(0,Math.floor(x0+mx)), xb=Math.min(sw,Math.ceil(x1-mx));
+  let ya=Math.max(0,Math.floor(y0+my)), yb=Math.min(sh,Math.ceil(y1-my));
+  if(xb<=xa){ xa=Math.max(0,Math.floor(x0)); xb=Math.min(sw,Math.ceil(x1)); }
+  if(yb<=ya){ ya=Math.max(0,Math.floor(y0)); yb=Math.min(sh,Math.ceil(y1)); }
+  const rs=[],gs=[],bs=[],as=[];
+  const stepX=Math.max(1,Math.floor((xb-xa)/7));
+  const stepY=Math.max(1,Math.floor((yb-ya)/7));
+  for(let y=ya;y<yb;y+=stepY){
+    for(let x=xa;x<xb;x+=stepX){
+      const i=(y*sw+x)*4;
+      as.push(data[i+3]);
+      if(data[i+3]>20){ rs.push(data[i]); gs.push(data[i+1]); bs.push(data[i+2]); }
+    }
+  }
+  return {r:median(rs),g:median(gs),b:median(bs),a:median(as)};
+}
+
 function sampleToGrid(width,height){
-  const off=document.createElement('canvas');
-  off.width=width; off.height=height;
-  const ox=off.getContext('2d',{willReadFrequently:true});
-  ox.imageSmoothingEnabled=true;
-  ox.imageSmoothingQuality='high';
-  ox.drawImage(img,0,0,width,height);
-  const d=ox.getImageData(0,0,width,height).data;
+  // Work from the ORIGINAL image resolution. We deliberately do not first
+  // shrink it with bilinear smoothing because that creates blended shades.
+  const src=document.createElement('canvas');
+  src.width=img.naturalWidth||img.width;
+  src.height=img.naturalHeight||img.height;
+  const sx=src.getContext('2d',{willReadFrequently:true});
+  sx.imageSmoothingEnabled=false;
+  sx.drawImage(img,0,0,src.width,src.height);
+  const d=sx.getImageData(0,0,src.width,src.height).data;
+  const bg=estimateBackgroundColor(src);
+  const bgLab=rgbToLab(bg.r,bg.g,bg.b);
   const cells=[]; const counts=new Map();
+
+  const useAligned=autoGrid && autoGrid.cols===width && autoGrid.rows===height;
+  const gx0=useAligned?autoGrid.x0:0, gy0=useAligned?autoGrid.y0:0;
+  const gx1=useAligned?autoGrid.x1:src.width, gy1=useAligned?autoGrid.y1:src.height;
+  const cw=(gx1-gx0)/width, ch=(gy1-gy0)/height;
   for(let y=0;y<height;y++){
     const row=[];
+    const y0=gy0+y*ch, y1=gy0+(y+1)*ch;
     for(let x=0;x<width;x++){
-      const i=(y*width+x)*4;
-      let r=d[i],g=d[i+1],b=d[i+2],a=d[i+3];
-      if(a<20) r=g=b=255;
-      const p=nearestColor(r,g,b);
+      const x0=gx0+x*cw, x1=gx0+(x+1)*cw;
+      const c=sampleCellMedian(d,src.width,src.height,x0,y0,x1,y1);
+      const lab=rgbToLab(c.r,c.g,c.b);
+      const bgDist=colorDistanceLab(lab,bgLab);
+      const maxc=Math.max(c.r,c.g,c.b), minc=Math.min(c.r,c.g,c.b);
+      const sat=maxc===0?0:(maxc-minc)/maxc;
+      const light=(c.r+c.g+c.b)/3;
+
+      // Blank cells should stay blank instead of becoming a cream/white bead.
+      // The edge-derived background test is robust for screenshots of patterns.
+      const isBlank=c.a<30 || bgDist<11 || (light>246 && sat<0.055);
+      if(isBlank){ row.push(null); continue; }
+
+      const p=nearestColor(c.r,c.g,c.b);
       row.push(p);
       counts.set(p.code,(counts.get(p.code)||0)+1);
     }
     cells.push(row);
   }
-  return {cells,counts};
+  return {cells,counts,bg};
 }
-
 function readableText(r,g,b){
   return (0.299*r+0.587*g+0.114*b)<130?'#fff':'#111';
 }
@@ -364,7 +549,7 @@ function generate(){
   drawPreview(lastResult);
   renderLegend(lastResult);
   document.getElementById('sizeStat').textContent=`${Wg}×${Hg}`;
-  document.getElementById('totalStat').textContent=(Wg*Hg).toLocaleString();
+  document.getElementById('totalStat').textContent=[...result.counts.values()].reduce((a,b)=>a+b,0).toLocaleString();
   document.getElementById('colorStat').textContent=result.counts.size;
   downloadBtn.disabled=false;
   savePatternBtn.disabled=false;
@@ -388,12 +573,12 @@ function drawGrid(res){
     for(let x=0;x<res.width;x++){
       const p=res.cells[y][x];
       const px=left+x*cell, py=top+y*cell;
-      ctx.fillStyle=`rgb(${p.r},${p.g},${p.b})`;
+      ctx.fillStyle=p ? `rgb(${p.r},${p.g},${p.b})` : '#ffffff';
       ctx.fillRect(px,py,cell,cell);
       ctx.strokeStyle='rgba(15,23,42,.24)';
       ctx.lineWidth=1;
       ctx.strokeRect(px+.5,py+.5,cell-1,cell-1);
-      if(cell>=20){
+      if(p && cell>=20){
         ctx.fillStyle=readableText(p.r,p.g,p.b);
         ctx.font=`800 ${Math.max(7,Math.floor(cell*.30))}px ui-monospace,SFMono-Regular,Menlo,monospace`;
         ctx.fillText(p.code,px+cell/2,py+cell/2);
@@ -410,7 +595,7 @@ function paintPixelPreview(canvas,res){
   for(let y=0;y<res.height;y++){
     for(let x=0;x<res.width;x++){
       const p=res.cells[y][x];
-      ctx.fillStyle=`rgb(${p.r},${p.g},${p.b})`;
+      ctx.fillStyle=p ? `rgb(${p.r},${p.g},${p.b})` : '#ffffff';
       ctx.fillRect(x*cell,y*cell,cell,cell);
     }
   }
@@ -472,11 +657,13 @@ function downloadPatternPNG(){
   for(let y=0;y<res.height;y++){
     for(let x=0;x<res.width;x++){
       const p=res.cells[y][x], px=left+x*cell,py=top+y*cell;
-      ctx.fillStyle=`rgb(${p.r},${p.g},${p.b})`;ctx.fillRect(px,py,cell,cell);
+      ctx.fillStyle=p ? `rgb(${p.r},${p.g},${p.b})` : '#ffffff';ctx.fillRect(px,py,cell,cell);
       ctx.strokeStyle='rgba(15,23,42,.28)';ctx.strokeRect(px+.5,py+.5,cell-1,cell-1);
-      ctx.fillStyle=readableText(p.r,p.g,p.b);
-      ctx.font='800 14px ui-monospace,SFMono-Regular,Menlo,monospace';
-      ctx.fillText(p.code,px+cell/2,py+cell/2);
+      if(p){
+        ctx.fillStyle=readableText(p.r,p.g,p.b);
+        ctx.font='800 14px ui-monospace,SFMono-Regular,Menlo,monospace';
+        ctx.fillText(p.code,px+cell/2,py+cell/2);
+      }
     }
   }
   const a=document.createElement('a');
